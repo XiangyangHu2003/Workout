@@ -75,6 +75,31 @@ create table if not exists public.body_metrics (
   -- 静默丢弃，不报错），导致晚到的那条真实数据永远进不了库。
   dedup_key text generated always as (metric || '|' || date_raw || '|' || coalesce(source, '')) stored
 );
+
+-- 兼容早期版本：旧去重键只有 metric + date_raw，会让同一时刻、不同来源的数据互相覆盖。
+-- 仅在检测到旧定义时迁移；重复执行本文件不会反复重建字段。
+do $$
+declare
+  dedup_expression text;
+begin
+  select pg_get_expr(ad.adbin, ad.adrelid)
+    into dedup_expression
+  from pg_attribute a
+  join pg_attrdef ad
+    on ad.adrelid = a.attrelid and ad.adnum = a.attnum
+  where a.attrelid = 'public.body_metrics'::regclass
+    and a.attname = 'dedup_key';
+
+  if dedup_expression is not null
+     and dedup_expression not ilike '%source%' then
+    drop index if exists public.body_metrics_user_dedup;
+    alter table public.body_metrics drop column dedup_key;
+    alter table public.body_metrics add column dedup_key text generated always as (
+      metric || '|' || date_raw || '|' || coalesce(source, '')
+    ) stored;
+  end if;
+end
+$$;
 alter table public.body_metrics enable row level security;
 revoke all on table public.body_metrics from anon;
 grant select, insert, delete on table public.body_metrics to authenticated;
