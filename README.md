@@ -80,3 +80,10 @@
 - 数据表已启用 Row Level Security，登录用户只能访问自己的数据。
 - `x-ingest-token` 相当于设备写入凭证，不要提交到 GitHub 或公开分享。
 - 前端只能使用 Supabase publishable / anon key，绝不要把 `service_role` key 写进网页或仓库。
+
+## 2026-07 安全部署更新
+
+- Watch 同步令牌现在由 Web Crypto 生成，数据库只保存 SHA-256 哈希。升级脚本会使旧令牌失效；升级后请在练迹设置中重新生成令牌，并更新 Health Auto Export 的 `x-ingest-token`。
+- `ingest_watch` 会拒绝非对象 JSON、超过 10 MB 的请求，以及数量异常的 workouts、metrics 或采样数组。
+- Cloudflare Workers 静态部署应同时上传根目录的 `index.html` 与 `_headers`，后者提供 HSTS、CSP、防嵌入和浏览器权限限制。
+- Cloudflare 生产环境建议开启 Workers Logs；当前站点不需要启用 Traces 或 Preview URLs。
