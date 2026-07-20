@@ -2,6 +2,10 @@
 -- 在 Supabase Dashboard > SQL Editor > New query 中执行整个文件。
 -- 设计：后端只负责“存原始 JSON”，字段解析放在网页端，方便日后无损调整。
 
+-- 清理旧环境中额外安装的公开 SECURITY DEFINER 事件触发器。
+drop event trigger if exists ensure_rls;
+drop function if exists public.rls_auto_enable();
+
 -- 1) 手表训练原始数据表（每条训练一行，payload 存 Health Auto Export 的原始 JSON）
 create table if not exists public.watch_workouts (
   id uuid primary key default gen_random_uuid(),
@@ -34,16 +38,40 @@ create index if not exists watch_workouts_user_created
 create unique index if not exists watch_workouts_user_dedup
   on public.watch_workouts(user_id, dedup_key);
 
--- 2) 设备同步令牌：手机端不方便携带会过期的登录 token，改用长期令牌换取 user_id
+-- 2) 设备同步令牌：浏览器只展示一次原始令牌，数据库仅保存 SHA-256 哈希。
+create extension if not exists pgcrypto with schema extensions;
 create table if not exists public.ingest_tokens (
-  token text primary key,
+  token_hash text primary key,
   user_id uuid not null references auth.users(id) on delete cascade,
   label text,
   created_at timestamptz not null default now()
 );
+
+-- 从旧版明文 token 结构迁移。仅在旧列仍存在时清空一次旧令牌，重复执行不会删除新令牌。
+do $$
+begin
+  if exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'ingest_tokens' and column_name = 'token'
+  ) then
+    if not exists (
+      select 1 from information_schema.columns
+      where table_schema = 'public' and table_name = 'ingest_tokens' and column_name = 'token_hash'
+    ) then
+      alter table public.ingest_tokens add column token_hash text;
+    end if;
+    delete from public.ingest_tokens;
+    alter table public.ingest_tokens drop constraint if exists ingest_tokens_pkey;
+    alter table public.ingest_tokens drop column token;
+    alter table public.ingest_tokens alter column token_hash set not null;
+    alter table public.ingest_tokens add primary key (token_hash);
+  end if;
+end
+$$;
 alter table public.ingest_tokens enable row level security;
 revoke all on table public.ingest_tokens from anon;
 grant select, insert, delete on table public.ingest_tokens to authenticated;
+create index if not exists ingest_tokens_user_id_idx on public.ingest_tokens(user_id);
 
 drop policy if exists "own tokens" on public.ingest_tokens;
 create policy "own tokens" on public.ingest_tokens
@@ -185,23 +213,42 @@ declare
   wk jsonb;
   m jsonb;
   s jsonb;
+  workouts_data jsonb;
+  metrics_data jsonb;
+  samples_data jsonb;
   n int := 0;
 begin
   hdr_token := (current_setting('request.headers', true)::jsonb) ->> 'x-ingest-token';
-  if hdr_token is null then
+  if hdr_token is null or length(hdr_token) < 32 then
     raise exception 'missing x-ingest-token header';
   end if;
 
-  select user_id into uid from public.ingest_tokens where token = hdr_token;
+  select user_id into uid
+  from public.ingest_tokens
+  where token_hash = encode(extensions.digest(hdr_token, 'sha256'), 'hex');
   if uid is null then
     raise exception 'invalid ingest token';
   end if;
 
+  if data is null or jsonb_typeof(data) <> 'object' then
+    raise exception 'request data must be a JSON object';
+  end if;
+  if pg_column_size(data) > 10485760 then
+    raise exception 'request data exceeds 10 MB';
+  end if;
+
+  workouts_data := coalesce(data -> 'workouts', data #> '{data,workouts}', '[]'::jsonb);
+  metrics_data := coalesce(data -> 'metrics', '[]'::jsonb);
+  if jsonb_typeof(workouts_data) <> 'array' or jsonb_typeof(metrics_data) <> 'array' then
+    raise exception 'workouts and metrics must be arrays';
+  end if;
+  if jsonb_array_length(workouts_data) > 500 or jsonb_array_length(metrics_data) > 200 then
+    raise exception 'request contains too many workouts or metrics';
+  end if;
+
   -- data 已是请求体 "data" 键的值；兼容 {workouts:[]} 与 {data:{workouts:[]}} 两种结构
   for wk in
-    select value from jsonb_array_elements(
-      coalesce(data -> 'workouts', data #> '{data,workouts}', '[]'::jsonb)
-    ) as t(value)
+    select value from jsonb_array_elements(workouts_data) as t(value)
   loop
     insert into public.watch_workouts(user_id, payload, source)
     values (uid, wk, 'auto')
@@ -211,11 +258,21 @@ begin
 
   -- Health Metrics：data.metrics[] → 每个指标的 data[] 采样（体脂秤/身体成分）
   for m in
-    select value from jsonb_array_elements(coalesce(data -> 'metrics', '[]'::jsonb)) as t(value)
+    select value from jsonb_array_elements(metrics_data) as t(value)
   loop
+    if jsonb_typeof(m) <> 'object' then
+      raise exception 'each metric must be an object';
+    end if;
+    samples_data := coalesce(m -> 'data', '[]'::jsonb);
+    if jsonb_typeof(samples_data) <> 'array' or jsonb_array_length(samples_data) > 20000 then
+      raise exception 'metric samples must be an array with at most 20000 items';
+    end if;
     for s in
-      select value from jsonb_array_elements(coalesce(m -> 'data', '[]'::jsonb)) as t2(value)
+      select value from jsonb_array_elements(samples_data) as t2(value)
     loop
+      if n >= 50000 then
+        raise exception 'request contains more than 50000 total items';
+      end if;
       if (s ->> 'qty') is not null and (s ->> 'date') is not null then
         insert into public.body_metrics(user_id, metric, date_raw, qty, unit, source)
         values (uid, m ->> 'name', s ->> 'date', nullif(s ->> 'qty','')::numeric, m ->> 'units', s ->> 'source')
@@ -237,4 +294,5 @@ begin
 end;
 $$;
 
+revoke all on function public.ingest_watch(jsonb) from public;
 grant execute on function public.ingest_watch(jsonb) to anon, authenticated;
